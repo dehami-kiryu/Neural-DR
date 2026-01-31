@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+  python exp2_2_gain_table.py \
+    --exp2_1_root ./exp2_1_out \
+    --out_csv ./table2_gain.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+import numpy as np
+
+
+
+
+
+def load_all_sweeps(root: Path) -> List[Path]:
+    return sorted(root.rglob("exp2_1_sweep.json"))
+
+
+def gain_from_runs(
+    full_runs: List[Dict[str, Any]],
+    sweep: Dict[str, Any],
+    method: str,
+) -> Tuple[float, float]:
+    """
+    Compute gain mean±std.
+
+    gain = MSE(k=N_s) / min_{k in K} MSE(k)
+
+    """
+    # Denominator: full-sensor MSE per seed
+    denom_by_seed: Dict[int, float] = {}
+    for r in full_runs:
+        if "seed" in r:
+            denom_by_seed[int(r["seed"])] = float(r["test_mse"])
+    if not denom_by_seed:
+        return float("nan"), float("nan")
+
+    denom_mean = float(np.mean(list(denom_by_seed.values())))
+
+    # -------- Top-k / Uniform (per-seed) --------
+    if method in ("topk", "uniform"):
+        gains: List[float] = []
+        for seed, denom in denom_by_seed.items():
+            mses: List[float] = []
+            for _r_str, entry in sweep.items():
+                m = entry["methods"][method]
+                run = next((rr for rr in m["runs"] if int(rr.get("seed", -1)) == seed), None)
+                if run is None:
+                    continue
+                mses.append(float(run["test_mse"]))
+            if not mses:
+                continue
+            gains.append(denom / float(np.min(mses)))
+        if not gains:
+            return float("nan"), float("nan")
+        return float(np.mean(gains)), float(np.std(gains, ddof=0))
+
+    # -------- Random (per-trial) --------
+    if method == "random":
+        runs_by_trial: Dict[int, List[float]] = {}
+        for _r_str, entry in sweep.items():
+            m = entry["methods"]["random"]
+            for rr in m["runs"]:
+                trial = rr.get("trial", None)
+                if trial is None:
+                    continue
+                runs_by_trial.setdefault(int(trial), []).append(float(rr["test_mse"]))
+
+        # If no trials exist (e.g., only r=0 in sweep), gain=1
+        if not runs_by_trial:
+            return 1.0, 0.0
+
+        gains: List[float] = []
+        for _trial, mses in runs_by_trial.items():
+            mses_aug = list(mses) + [denom_mean]  # ensure k=N_s is included in min
+            gains.append(denom_mean / float(np.min(mses_aug)))
+
+        return float(np.mean(gains)), float(np.std(gains, ddof=0))
+
+    raise ValueError(f"Unknown method: {method}")
+
+
+def main() -> None:
+    args = parse_args()
+    root = Path(args.exp2_1_root)
+    paths = load_all_sweeps(root)
+    if not paths:
+        raise FileNotFoundError(f"No exp2_1_sweep.json found under {root}")
+
+    # Accumulate rows: (task, model, topk_gain, uniform_gain, random_gain)
+    rows = []
+    for p in paths:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        task = d["task"]
+        model = d["model"]
+        full_runs = d["full"]["runs"]
+        sweep = d["sweep"]
+
+        topk_mean, topk_std = gain_from_runs(full_runs, sweep, "topk")
+        uni_mean, uni_std = gain_from_runs(full_runs, sweep, "uniform")
+        rnd_mean, rnd_std = gain_from_runs(full_runs, sweep, "random")
+
+        rows.append({
+            "task": task,
+            "model": model,
+            "topk_gain_mean": topk_mean,
+            "topk_gain_std": topk_std,
+            "uniform_gain_mean": uni_mean,
+            "uniform_gain_std": uni_std,
+            "random_gain_mean": rnd_mean,
+            "random_gain_std": rnd_std,
+            "json_path": str(p),
+        })
+
+    # Print Markdown-ish table
+    # Group by model
+    models = sorted(set(r["model"] for r in rows))
+    tasks = sorted(set(r["task"] for r in rows))
+
+    def fmt(m: float, s: float) -> str:
+        if np.isnan(m) or np.isnan(s):
+            return "nan"
+        return f"{m:.2f} ({s:.2f})"
+
+    for model in models:
+        print()
+        print(f"## Gain table: {model}")
+        print("| Task | Top-k gain | Uniform gain | Random gain |")
+        print("|---|---:|---:|---:|")
+        for task in tasks:
+            r = next((x for x in rows if x["task"] == task and x["model"] == model), None)
+            if r is None:
+                continue
+            print("| "
+                  f"{task} | "
+                  f"{fmt(r['topk_gain_mean'], r['topk_gain_std'])} | "
+                  f"{fmt(r['uniform_gain_mean'], r['uniform_gain_std'])} | "
+                  f"{fmt(r['random_gain_mean'], r['random_gain_std'])} |")
+
+    # Optional CSV
+    if args.out_csv is not None:
+        out_csv = Path(args.out_csv)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+        print(f"\nSaved CSV: {out_csv}")
+
+
+if __name__ == "__main__":
+    main()
