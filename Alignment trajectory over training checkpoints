@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Experiment 1.3　: Alignment trajectory over training checkpoints (Fig. 1(c))
+
+What this script does:
+  - Train a neural operator (here: a simple DeepONet) on a toy PDE mapping u0(x) -> u(x,T)
+  - At multiple checkpoints during training (every N epochs), compute Alignment as in the paper
+  - Save and plot Alignment vs epoch (trajectory)
+
+Paper alignment definition (Sec. 5.3.1 / 5.3.3, App. A.6):
+  - 1D periodic domain [0,L), L=1.0
+  - prediction horizon T=1.0
+  - c=1.0 for advection/wave, kappa=0.01 for heat
+  - eps=1e-12
+  - Palign=128 query points (uniform)
+  - Malign=32 input samples (subsampled from val)
+  - per-y normalization and cosine similarity, then average over y and samples
+
+Training hyperparameters follow Table 8 defaults for 1D:
+  - AdamW, lr=3e-4, betas=(0.9,0.95), weight_decay=1e-4
+  - cosine decay + 10 epoch warmup
+  - grad clip = 1.0
+  - epochs=400, batch=32
+  - z-score normalization for inputs/outputs (train stats)
+
+Requirements:
+  - Python 3.9+
+  - numpy, torch, matplotlib
+
+Examples:
+  python exp1_3_alignment_trajectory_toy.py --pde advection --device cuda --eval_every 5
+  python exp1_3_alignment_trajectory_toy.py --pde wave --eval_every 1
+  python exp1_3_alignment_trajectory_toy.py --pde heat --kappa 0.01
+"""
+
+import argparse
+import math
+import os
+import random
+from dataclasses import dataclass
+from typing import Tuple, List
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+
+# -----------------------
+# Repro utilities
+# -----------------------
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def periodic_mod(x: np.ndarray, L: float) -> np.ndarray:
+    return np.mod(x, L)
+
+
+def dper(a: np.ndarray, b: np.ndarray, L: float) -> np.ndarray:
+    diff = np.abs(a - b)
+    return np.minimum(diff, L - diff)
+
+
+# -----------------------
+# Toy PDE (analytic) data
+# -----------------------
+@dataclass
+class ToyPDEConfig:
+    L: float = 1.0
+    T: float = 1.0
+    c: float = 1.0
+    kappa: float = 0.01
+    K: int = 20
+    coeff_decay: float = 2.0
+
+
+def sample_random_fourier_coeffs(K: int, coeff_decay: float, rng: np.random.Generator):
+    """
+    u0(x) = Σ_{k=1..K} a_k sin(2πk x/L) + b_k cos(2πk x/L)
+    with coefficients decaying like 1/k^coeff_decay
+    """
+    ks = np.arange(1, K + 1, dtype=np.float64)
+    scale = 1.0 / (ks ** coeff_decay)
+    a = rng.normal(0.0, 1.0, size=K) * scale
+    b = rng.normal(0.0, 1.0, size=K) * scale
+    return a.astype(np.float32), b.astype(np.float32)
+
+
+def eval_fourier_series(x: np.ndarray, a: np.ndarray, b: np.ndarray, L: float) -> np.ndarray:
+    K = a.shape[0]
+    ks = np.arange(1, K + 1, dtype=np.float64)
+    phase = 2.0 * math.pi * np.outer(x / L, ks)  # (len(x), K)
+    u = np.sin(phase) @ a + np.cos(phase) @ b
+    return u.astype(np.float32)
+
+
+def solve_toy_pde(pde: str, x: np.ndarray, a: np.ndarray, b: np.ndarray, cfg: ToyPDEConfig) -> np.ndarray:
+    """
+    Compute u(x, T) on periodic domain.
+    """
+    if pde == "advection":
+        # right-going advection: u(x,T) = u0(x - cT)
+        x0 = periodic_mod(x - cfg.c * cfg.T, cfg.L)
+        return eval_fourier_series(x0, a, b, cfg.L)
+
+    if pde == "wave":
+        # wave with zero initial velocity: u(x,T) = 0.5*(u0(x-cT)+u0(x+cT))
+        x_minus = periodic_mod(x - cfg.c * cfg.T, cfg.L)
+        x_plus = periodic_mod(x + cfg.c * cfg.T, cfg.L)
+        return 0.5 * (eval_fourier_series(x_minus, a, b, cfg.L) + eval_fourier_series(x_plus, a, b, cfg.L))
+
+    if pde == "heat":
+        # heat: each Fourier mode decays by exp(-(2πk/L)^2 κ T)
+        K = a.shape[0]
+        ks = np.arange(1, K + 1, dtype=np.float64)
+        decay = np.exp(-((2.0 * math.pi * ks / cfg.L) ** 2) * cfg.kappa * cfg.T).astype(np.float32)
+        aT = a * decay
+        bT = b * decay
+        return eval_fourier_series(x, aT, bT, cfg.L)
+
+    raise ValueError(f"Unknown pde: {pde}")
+
+
+def make_dataset(
+    pde: str,
+    n: int,
+    sensor_x: np.ndarray,
+    query_y: np.ndarray,
+    cfg: ToyPDEConfig,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    u0_list, uT_list = [], []
+    for _ in range(n):
+        a, b = sample_random_fourier_coeffs(cfg.K, cfg.coeff_decay, rng)
+        u0 = eval_fourier_series(sensor_x, a, b, cfg.L)  # (Ns,)
+        uT = solve_toy_pde(pde, query_y, a, b, cfg)       # (P,)
+        u0_list.append(u0)
+        uT_list.append(uT)
+    return np.stack(u0_list, axis=0), np.stack(uT_list, axis=0)
+
+
+# -----------------------
+# DeepONet (branch-trunk)
+# -----------------------
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, depth: int = 3):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for _ in range(depth - 1):
+            layers += [nn.Linear(d, hidden_dim), nn.GELU()]
+            d = hidden_dim
+        layers += [nn.Linear(d, out_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DeepONet(nn.Module):
+    """
+    Dot-product DeepONet:
+      û(u0, y) = <B(u0), T(y)> + b
+    """
+    def __init__(self, nsensors: int, latent_dim: int = 128, branch_hidden: int = 256, trunk_hidden: int = 256):
+        super().__init__()
+        self.branch = MLP(nsensors, branch_hidden, latent_dim, depth=3)
+        self.trunk = MLP(1, trunk_hidden, latent_dim, depth=3)
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, u0: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        # u0: (B,Ns), y: (P,1) -> (B,P)
+        bfeat = self.branch(u0)
+        tfeat = self.trunk(y)
+        return bfeat @ tfeat.t() + self.bias
+
+
+# -----------------------
+# LR schedule (cosine + warmup)
+# -----------------------
+def cosine_warmup_lr(step: int, total_steps: int, base_lr: float, warmup_steps: int) -> float:
+    if step < warmup_steps:
+        return base_lr * (step / max(1, warmup_steps))
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return 0.5 * base_lr * (1.0 + math.cos(math.pi * progress))
+
+
+# -----------------------
+# Reference influence map q(y,xi)
+# -----------------------
+def reference_q_map(
+    pde: str,
+    y_points: np.ndarray,      # (P,)
+    sensor_x: np.ndarray,      # (Ns,)
+    cfg: ToyPDEConfig,
+    eps: float,
+) -> np.ndarray:
+    """
+    Return q(y_p, xi_j) as (P,Ns), per the paper's toy PDE definitions.
+    """
+    P = y_points.shape[0]
+    Ns = sensor_x.shape[0]
+    Y = y_points.reshape(P, 1)
+    X = sensor_x.reshape(1, Ns)
+
+    if pde == "wave":
+        dist = dper(Y, X, cfg.L)
+        q = (dist <= (cfg.c * cfg.T)).astype(np.float32)
+        return q
+
+    if pde == "heat":
+        dist = dper(Y, X, cfg.L)
+        denom = (4.0 * cfg.kappa * cfg.T) + eps
+        q = np.exp(-(dist * dist) / denom).astype(np.float32)
+        return q
+
+    if pde == "advection":
+        # upstream distance: (y - xi) mod L in [0,L); upstream if within cT
+        dist_up = np.mod(Y - X, cfg.L)
+        q = (dist_up <= (cfg.c * cfg.T)).astype(np.float32)
+        return q
+
+    raise ValueError(f"Unknown pde: {pde}")
+
+
+def normalize_per_y(mat: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    mat: (P,Ns), nonnegative
+    return: normalized over Ns per row (per y)
+    """
+    return mat / (mat.sum(dim=1, keepdim=True) + eps)
+
+
+# -----------------------
+# Alignment (vectorized over samples; loops over y)
+# -----------------------
+def compute_alignment_vectorized(
+    model: nn.Module,
+    u0_samples: torch.Tensor,     # (M,Ns), normalized inputs
+    y_points: torch.Tensor,       # (P,1)
+    q_tilde: torch.Tensor,        # (P,Ns), normalized ref map
+    device: torch.device,
+    eps: float,
+) -> float:
+    """
+    Alignment ≈ (1/(M*P)) Σ_{m,p} cosine( q_tilde[p,:], G_tilde^{(m,p)} )
+
+    where G_tilde^{(m,p)} is the per-sample Jacobian-energy vector at y_p,
+    normalized over sensors.
+    """
+    model.eval()
+
+    u0 = u0_samples.to(device).clone().requires_grad_(True)  # (M,Ns)
+    y = y_points.to(device)                                  # (P,1)
+    q_tilde = q_tilde.to(device)                              # (P,Ns)
+
+    u_hat = model(u0, y)                                      # (M,P)
+    M, P = u_hat.shape
+
+    align_sum = 0.0
+
+    for p in range(P):
+        scalar = u_hat[:, p].sum()
+        grad = torch.autograd.grad(
+            outputs=scalar,
+            inputs=u0,
+            retain_graph=(p < P - 1),
+            create_graph=False,
+        )[0]  # (M,Ns)
+
+        e = grad * grad                                      # (M,Ns)
+        G_tilde = e / (e.sum(dim=1, keepdim=True) + eps)      # (M,Ns)
+
+        qv = q_tilde[p]                                       # (Ns,)
+        q_norm = qv.norm(p=2) + eps
+        G_norm = G_tilde.norm(p=2, dim=1) + eps               # (M,)
+
+        cos = (G_tilde * qv).sum(dim=1) / (q_norm * G_norm)   # (M,)
+        align_sum += cos.sum().item()
+
+    return align_sum / (M * P)
+
+
+# -----------------------
+# Training + trajectory
+# -----------------------
+def train_with_alignment_trajectory(
+    model: nn.Module,
+    train_loader: DataLoader,
+    y_points: torch.Tensor,          # (P,1)
+    u0_align: torch.Tensor,          # (Malign,Ns), fixed subset
+    q_tilde: torch.Tensor,           # (P,Ns)
+    device: torch.device,
+    epochs: int,
+    eval_every: int,
+    lr: float,
+    weight_decay: float,
+    warmup_epochs: int,
+    grad_clip: float,
+    eps: float,
+) -> Tuple[List[int], List[float]]:
+    """
+    Train model and compute Alignment at epoch 0 and then every eval_every epochs.
+    Returns:
+      epochs_list: list of epoch indices when Alignment computed
+      align_list : list of Alignment values
+    """
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=weight_decay)
+
+    steps_per_epoch = len(train_loader)
+    total_steps = max(1, epochs * steps_per_epoch)
+    warmup_steps = warmup_epochs * steps_per_epoch
+    global_step = 0
+
+    epochs_list: List[int] = []
+    align_list: List[float] = []
+
+    # epoch 0 (initial checkpoint)
+    with torch.set_grad_enabled(True):
+        align0 = compute_alignment_vectorized(model, u0_align, y_points, q_tilde, device=device, eps=eps)
+    epochs_list.append(0)
+    align_list.append(float(align0))
+    print(f"[epoch {0:4d}] Alignment={align0:.6f}")
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        for u0_batch, uT_batch in train_loader:
+            u0_batch = u0_batch.to(device)
+            uT_batch = uT_batch.to(device)
+
+            pred = model(u0_batch, y_points)   # (B,P)
+            loss = F.mse_loss(pred, uT_batch)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            lr_now = cosine_warmup_lr(global_step, total_steps, lr, warmup_steps)
+            for pg in opt.param_groups:
+                pg["lr"] = lr_now
+            opt.step()
+
+            global_step += 1
+
+        # checkpoint alignment
+        if (ep % eval_every == 0) or (ep == epochs):
+            with torch.set_grad_enabled(True):
+                align = compute_alignment_vectorized(model, u0_align, y_points, q_tilde, device=device, eps=eps)
+            epochs_list.append(ep)
+            align_list.append(float(align))
+            print(f"[epoch {ep:4d}] Alignment={align:.6f}")
+
+    return epochs_list, align_list
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pde", choices=["advection", "wave", "heat"], default="advection")
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--seed", type=int, default=0)
+
+    parser.add_argument("--outdir", type=str, default="outputs_exp1_3")
+
+    # Paper constants (defaults match App. A.6 / Table 10)
+    parser.add_argument("--L", type=float, default=1.0)
+    parser.add_argument("--T", type=float, default=1.0)
+    parser.add_argument("--c", type=float, default=1.0)
+    parser.add_argument("--kappa", type=float, default=0.01)
+    parser.add_argument("--eps", type=float, default=1e-12)
+
+    # discretization / alignment config
+    parser.add_argument("--nsensors", type=int, default=100)
+    parser.add_argument("--Palign", type=int, default=128)
+    parser.add_argument("--Malign", type=int, default=32)
+
+    # dataset sizes (toy)
+    parser.add_argument("--ntrain", type=int, default=1024)
+    parser.add_argument("--nval", type=int, default=128)
+
+    # IC distribution
+    parser.add_argument("--K", type=int, default=20)
+    parser.add_argument("--coeff_decay", type=float, default=2.0)
+
+    # training hyperparameters (Table 8 defaults for 1D)
+    parser.add_argument("--epochs", type=int, default=400)
+    parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=10)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+
+    # trajectory sampling
+    parser.add_argument("--eval_every", type=int, default=10, help="Compute Alignment every N epochs (set 1 for every epoch).")
+
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    device = torch.device(args.device)
+    os.makedirs(args.outdir, exist_ok=True)
+
+    cfg = ToyPDEConfig(
+        L=args.L,
+        T=args.T,
+        c=args.c,
+        kappa=args.kappa,
+        K=args.K,
+        coeff_decay=args.coeff_decay,
+    )
+
+    # sensors and query points (periodic, endpoint=False)
+    sensor_x = np.linspace(0.0, cfg.L, args.nsensors, endpoint=False, dtype=np.float64)
+    y_align = np.linspace(0.0, cfg.L, args.Palign, endpoint=False, dtype=np.float64)
+
+    # datasets (train/val)
+    u0_train, uT_train = make_dataset(args.pde, args.ntrain, sensor_x, y_align, cfg, seed=args.seed + 1)
+    u0_val, uT_val = make_dataset(args.pde, args.nval, sensor_x, y_align, cfg, seed=args.seed + 2)
+
+    # z-score normalization (train stats)
+    u0_mean = u0_train.mean(axis=0, keepdims=True)
+    u0_std = u0_train.std(axis=0, keepdims=True) + 1e-12
+    u0_train_n = (u0_train - u0_mean) / u0_std
+    u0_val_n = (u0_val - u0_mean) / u0_std
+
+    uT_mean = float(uT_train.mean())
+    uT_std = float(uT_train.std()) + 1e-12
+    uT_train_n = (uT_train - uT_mean) / uT_std
+    uT_val_n = (uT_val - uT_mean) / uT_std
+
+    train_ds = TensorDataset(torch.from_numpy(u0_train_n).to(torch.float32),
+                             torch.from_numpy(uT_train_n).to(torch.float32))
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, drop_last=False)
+
+    # model + query points
+    model = DeepONet(nsensors=args.nsensors, latent_dim=128, branch_hidden=256, trunk_hidden=256).to(device)
+    y_points = torch.from_numpy(y_align.astype(np.float32)).view(-1, 1).to(device)  # (P,1)
+
+    # reference q_tilde (normalized per y)
+    q = reference_q_map(args.pde, y_align, sensor_x, cfg, eps=args.eps)  # (P,Ns)
+    q_tilde = normalize_per_y(torch.from_numpy(q).to(torch.float32), eps=args.eps)  # (P,Ns)
+
+    # fixed Malign subset from val (as per paper)
+    Malign_eff = min(args.Malign, u0_val_n.shape[0])
+    u0_align = torch.from_numpy(u0_val_n[:Malign_eff]).to(torch.float32)  # (M,Ns)
+
+    # train + compute trajectory
+    epochs_list, align_list = train_with_alignment_trajectory(
+        model=model,
+        train_loader=train_loader,
+        y_points=y_points,
+        u0_align=u0_align,
+        q_tilde=q_tilde,
+        device=device,
+        epochs=args.epochs,
+        eval_every=max(1, args.eval_every),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_epochs=args.warmup_epochs,
+        grad_clip=args.grad_clip,
+        eps=args.eps,
+    )
+
+    # save trajectory to CSV
+    out_csv = os.path.join(args.outdir, f"exp1_3_alignment_traj_{args.pde}_seed{args.seed}.csv")
+    with open(out_csv, "w", encoding="utf-8") as f:
+        f.write("epoch,alignment\n")
+        for ep, al in zip(epochs_list, align_list):
+            f.write(f"{ep},{al:.10f}\n")
+    print(f"[OK] saved: {out_csv}")
+
+    # plot
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(6, 4))
+    plt.plot(epochs_list, align_list)
+    plt.xlabel("Epoch")
+    plt.ylabel("Alignment")
+    plt.title(f"Alignment trajectory (Toy PDE: {args.pde})")
+    plt.ylim(0.0, 1.02)
+    plt.grid(True, alpha=0.3)
+
+    out_png = os.path.join(args.outdir, f"exp1_3_alignment_traj_{args.pde}_seed{args.seed}.png")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    print(f"[OK] saved: {out_png}")
+
+
+if __name__ == "__main__":
+    main()
