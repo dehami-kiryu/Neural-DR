@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Experiment 1.1 : Visualize Jacobian-energy dependency map G^2_theta(y, xi)
+
+Implements the paper's definition:
+  J_theta,j(u0, y) = ∂G_theta(u0, y) / ∂u0(xi_j)                      (Eq. 3)
+  E_theta(u0, y, xi_j) = (J_theta,j(u0, y))^2                         (Eq. 4)
+  G^2_theta(y, xi_j) = E_{u0} [ E_theta(u0, y, xi_j) ]                (Eq. 5)
+
+This script:
+  1) generates analytic toy PDE datasets on 1D periodic domain
+  2) trains a simple DeepONet (branch-trunk) as a neural operator
+  3) computes G^2_theta(y, xi) via autograd gradients
+  4) saves the heatmap figure (dependency map) as PNG
+
+Requirements:
+  - Python 3.9+
+  - numpy, torch, matplotlib
+
+Example:
+  python exp1_1_toy_dependency_map.py --pde advection --device cuda
+  python exp1_1_toy_dependency_map.py --pde wave
+  python exp1_1_toy_dependency_map.py --pde heat --kappa 0.01
+"""
+
+import argparse
+import math
+import os
+import random
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+
+# -----------------------
+# Repro utilities
+# -----------------------
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # deterministic for reproducibility (can slow down a bit)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def periodic_mod(x: np.ndarray, L: float) -> np.ndarray:
+    """Map x to [0, L)."""
+    return np.mod(x, L)
+
+
+# -----------------------
+# Toy PDE (analytic) data
+# -----------------------
+@dataclass
+class ToyPDEConfig:
+    L: float = 1.0        # periodic domain length
+    T: float = 0.5        # prediction horizon
+    c: float = 1.0        # speed for advection/wave
+    kappa: float = 0.01   # diffusion coefficient for heat
+    K: int = 20           # number of Fourier modes for random IC
+    coeff_decay: float = 2.0  # std ~ 1/k^coeff_decay
+
+
+def sample_random_fourier_coeffs(K: int, coeff_decay: float, rng: np.random.Generator):
+    """
+    u0(x) = Σ_{k=1..K} a_k sin(2πk x/L) + b_k cos(2πk x/L)
+    """
+    ks = np.arange(1, K + 1, dtype=np.float64)
+    scale = 1.0 / (ks ** coeff_decay)
+    a = rng.normal(0.0, 1.0, size=K) * scale
+    b = rng.normal(0.0, 1.0, size=K) * scale
+    return a.astype(np.float32), b.astype(np.float32)
+
+
+def eval_fourier_series(x: np.ndarray, a: np.ndarray, b: np.ndarray, L: float) -> np.ndarray:
+    """Evaluate u0(x) for x (vector) on [0,L)."""
+    K = a.shape[0]
+    ks = np.arange(1, K + 1, dtype=np.float64)
+    phase = 2.0 * math.pi * np.outer(x / L, ks)  # (len(x), K)
+    u = np.sin(phase) @ a + np.cos(phase) @ b
+    return u.astype(np.float32)
+
+
+def solve_toy_pde(pde: str, x: np.ndarray, a: np.ndarray, b: np.ndarray, cfg: ToyPDEConfig) -> np.ndarray:
+    """Compute u(x, T) on periodic domain for the chosen toy PDE."""
+    if pde == "advection":
+        # right-going advection: u(x,T) = u0(x - cT)
+        x0 = periodic_mod(x - cfg.c * cfg.T, cfg.L)
+        return eval_fourier_series(x0, a, b, cfg.L)
+
+    if pde == "wave":
+        # wave with zero initial velocity (simple d'Alembert form):
+        # u(x,T) = 0.5*(u0(x-cT) + u0(x+cT))
+        x_minus = periodic_mod(x - cfg.c * cfg.T, cfg.L)
+        x_plus = periodic_mod(x + cfg.c * cfg.T, cfg.L)
+        return 0.5 * (eval_fourier_series(x_minus, a, b, cfg.L) + eval_fourier_series(x_plus, a, b, cfg.L))
+
+    if pde == "heat":
+        # heat: each Fourier mode decays by exp(-(2πk/L)^2 κ T)
+        K = a.shape[0]
+        ks = np.arange(1, K + 1, dtype=np.float64)
+        decay = np.exp(-((2.0 * math.pi * ks / cfg.L) ** 2) * cfg.kappa * cfg.T).astype(np.float32)
+        aT = a * decay
+        bT = b * decay
+        return eval_fourier_series(x, aT, bT, cfg.L)
+
+    raise ValueError(f"Unknown pde: {pde}")
+
+
+def make_dataset(
+    pde: str,
+    n: int,
+    sensor_x: np.ndarray,
+    query_y: np.ndarray,
+    cfg: ToyPDEConfig,
+    seed: int,
+):
+    rng = np.random.default_rng(seed)
+    u0_list, uT_list = [], []
+    for _ in range(n):
+        a, b = sample_random_fourier_coeffs(cfg.K, cfg.coeff_decay, rng)
+        u0 = eval_fourier_series(sensor_x, a, b, cfg.L)         # (Ns,)
+        uT = solve_toy_pde(pde, query_y, a, b, cfg)             # (P,)
+        u0_list.append(u0)
+        uT_list.append(uT)
+    return np.stack(u0_list, axis=0), np.stack(uT_list, axis=0)
+
+
+# -----------------------
+# DeepONet (branch-trunk)
+# -----------------------
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, depth: int = 3):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for _ in range(depth - 1):
+            layers += [nn.Linear(d, hidden_dim), nn.GELU()]
+            d = hidden_dim
+        layers += [nn.Linear(d, out_dim)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DeepONet(nn.Module):
+    """
+    Standard dot-product DeepONet:
+      û(u0, y) = <B(u0), T(y)> + b
+    """
+    def __init__(self, nsensors: int, latent_dim: int = 128, branch_hidden: int = 256, trunk_hidden: int = 256):
+        super().__init__()
+        self.branch = MLP(nsensors, branch_hidden, latent_dim, depth=3)
+        self.trunk = MLP(1, trunk_hidden, latent_dim, depth=3)
+        self.bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, u0: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        u0: (B, Ns)
+        y : (P, 1)
+        return: (B, P)
+        """
+        bfeat = self.branch(u0)      # (B, latent)
+        tfeat = self.trunk(y)        # (P, latent)
+        return bfeat @ tfeat.t() + self.bias
+
+
+# -----------------------
+# Train loop (simple)
+# -----------------------
+def cosine_warmup_lr(step: int, total_steps: int, base_lr: float, warmup_steps: int) -> float:
+    if step < warmup_steps:
+        return base_lr * (step / max(1, warmup_steps))
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return 0.5 * base_lr * (1.0 + math.cos(math.pi * progress))
+
+
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    y_points: torch.Tensor,   # (P,1)
+    device: torch.device,
+    epochs: int,
+    lr: float = 3e-4,
+    weight_decay: float = 1e-4,
+    warmup_epochs: int = 10,
+    grad_clip: float = 1.0,
+):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=weight_decay)
+
+    best_val = float("inf")
+    best_state = None
+
+    steps_per_epoch = len(train_loader)
+    total_steps = max(1, epochs * steps_per_epoch)
+    warmup_steps = warmup_epochs * steps_per_epoch
+    global_step = 0
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        train_sum = 0.0
+
+        for u0_batch, uT_batch in train_loader:
+            u0_batch = u0_batch.to(device)
+            uT_batch = uT_batch.to(device)
+
+            pred = model(u0_batch, y_points)   # (B,P)
+            loss = F.mse_loss(pred, uT_batch)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            lr_now = cosine_warmup_lr(global_step, total_steps, lr, warmup_steps)
+            for pg in opt.param_groups:
+                pg["lr"] = lr_now
+
+            opt.step()
+
+            train_sum += loss.item() * u0_batch.shape[0]
+            global_step += 1
+
+        train_mse = train_sum / len(train_loader.dataset)
+
+        # val
+        model.eval()
+        val_sum = 0.0
+        with torch.no_grad():
+            for u0_batch, uT_batch in val_loader:
+                u0_batch = u0_batch.to(device)
+                uT_batch = uT_batch.to(device)
+                pred = model(u0_batch, y_points)
+                val_sum += F.mse_loss(pred, uT_batch, reduction="sum").item()
+
+        val_mse = val_sum / (len(val_loader.dataset) * y_points.shape[0])
+
+        if val_mse < best_val:
+            best_val = val_mse
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        if ep == 1 or ep % max(1, epochs // 10) == 0:
+            print(f"[epoch {ep:4d}] train_mse={train_mse:.6e}  val_mse={val_mse:.6e}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model
+
+
+# -----------------------
+# Experiment 1.1: G^2 map
+# -----------------------
+def compute_dependency_map_G2(
+    model: nn.Module,
+    u0_samples: torch.Tensor,  # (M, Ns)  (normalized input)
+    y_points: torch.Tensor,    # (P, 1)
+    device: torch.device,
+) -> np.ndarray:
+    """
+    Compute:
+      G^2_theta(y_p, xi_j) ≈ (1/M) Σ_m (∂û(u0_m, y_p) / ∂u0_m(xi_j))^2
+
+    Returns:
+      dep_map: (P, Ns) numpy array
+    """
+    model.eval()
+
+    # Make input differentiable
+    u0 = u0_samples.to(device).clone().requires_grad_(True)  # (M,Ns)
+    y = y_points.to(device)                                  # (P,1)
+
+    # One forward builds graph for all y
+    u_hat = model(u0, y)                                     # (M,P)
+    M, P = u_hat.shape
+    Ns = u0.shape[1]
+
+    dep = torch.zeros((P, Ns), device=device)
+
+    # Loop over query points y_p (matches the paper's Alg.1 inner loop style)
+    for p in range(P):
+        scalar = u_hat[:, p].sum()  # sum over samples so autograd returns per-sample grads (batch-independent)
+        grad = torch.autograd.grad(
+            outputs=scalar,
+            inputs=u0,
+            retain_graph=(p < P - 1),
+            create_graph=False,
+        )[0]  # (M, Ns)
+
+        dep[p] = (grad * grad).mean(dim=0)  # average over u0 samples (expectation)
+
+    return dep.detach().cpu().numpy()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pde", choices=["advection", "wave", "heat"], default="advection")
+
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--outdir", type=str, default="outputs_exp1_1")
+
+    # dataset sizes
+    parser.add_argument("--ntrain", type=int, default=1024)
+    parser.add_argument("--nval", type=int, default=128)
+
+    # discretization
+    parser.add_argument("--nsensors", type=int, default=100)
+    parser.add_argument("--pquery", type=int, default=128)   # Palign-like
+
+    # training
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch", type=int, default=32)
+
+    # toy PDE constants (you can change these)
+    parser.add_argument("--L", type=float, default=1.0)
+    parser.add_argument("--T", type=float, default=0.5)
+    parser.add_argument("--c", type=float, default=1.0)
+    parser.add_argument("--kappa", type=float, default=0.01)
+    parser.add_argument("--K", type=int, default=20)
+    parser.add_argument("--coeff_decay", type=float, default=2.0)
+
+    # dependency-map estimation batch size (Malign)
+    parser.add_argument("--Malign", type=int, default=32)
+
+    args = parser.parse_args()
+
+    set_seed(args.seed)
+    device = torch.device(args.device)
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    cfg = ToyPDEConfig(
+        L=args.L, T=args.T, c=args.c, kappa=args.kappa,
+        K=args.K, coeff_decay=args.coeff_decay
+    )
+
+    # Sensors and query points (periodic, endpoint=False)
+    sensor_x = np.linspace(0.0, cfg.L, args.nsensors, endpoint=False, dtype=np.float64)
+    query_y = np.linspace(0.0, cfg.L, args.pquery, endpoint=False, dtype=np.float64)
+
+    # Build datasets
+    u0_train, uT_train = make_dataset(args.pde, args.ntrain, sensor_x, query_y, cfg, seed=args.seed + 1)
+    u0_val, uT_val = make_dataset(args.pde, args.nval, sensor_x, query_y, cfg, seed=args.seed + 2)
+
+    # Normalization (matches the paper's stated practice: z-score; input per-dimension, output per-channel)
+    u0_mean = u0_train.mean(axis=0, keepdims=True)
+    u0_std = u0_train.std(axis=0, keepdims=True) + 1e-12
+    u0_train_n = (u0_train - u0_mean) / u0_std
+    u0_val_n = (u0_val - u0_mean) / u0_std
+
+    uT_mean = float(uT_train.mean())
+    uT_std = float(uT_train.std()) + 1e-12
+    uT_train_n = (uT_train - uT_mean) / uT_std
+    uT_val_n = (uT_val - uT_mean) / uT_std
+
+    train_ds = TensorDataset(torch.from_numpy(u0_train_n), torch.from_numpy(uT_train_n))
+    val_ds = TensorDataset(torch.from_numpy(u0_val_n), torch.from_numpy(uT_val_n))
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=max(64, args.batch), shuffle=False, drop_last=False)
+
+    # Model
+    model = DeepONet(nsensors=args.nsensors, latent_dim=128, branch_hidden=256, trunk_hidden=256).to(device)
+    y_points = torch.from_numpy(query_y.astype(np.float32)).view(-1, 1).to(device)  # (P,1)
+
+    # Train
+    model = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        y_points=y_points,
+        device=device,
+        epochs=args.epochs,
+    )
+
+    # -------------------------
+    # Experiment 1.1: compute G^2 map and plot
+    # -------------------------
+    Malign = min(args.Malign, len(val_ds))
+    u0_samples = torch.from_numpy(u0_val_n[:Malign])  # (Malign,Ns)
+
+    dep = compute_dependency_map_G2(model, u0_samples, y_points, device=device)  # (P,Ns)
+
+    # Plot heatmap
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(dep, origin="lower", aspect="auto", extent=[0.0, cfg.L, 0.0, cfg.L])
+    plt.xlabel(r"$\xi$ (sensor location)")
+    plt.ylabel(r"$y$ (output location)")
+    plt.title(f"Jacobian-energy dependency map $G_\\theta^2(y,\\xi)$\nToy PDE: {args.pde}")
+    plt.colorbar()
+
+    out_png = os.path.join(args.outdir, f"exp1_1_depmap_{args.pde}.png")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    print(f"[OK] saved: {out_png}")
+
+
+if __name__ == "__main__":
+    main()
