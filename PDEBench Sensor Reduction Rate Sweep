@@ -1,0 +1,1333 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+  python exp2_1_pdebench_sensor_sweep.py \
+    --data_root /path/to/PDEBench \
+    --out_dir ./exp2_1_out \
+    --device cuda \
+    --tasks Advection Burgers1D Wave Heat DiffusionReaction1D DiffusionSorption1D \
+            Darcy2D ShallowWater2D CompressibleNS2D CompressibleNS3D \
+    --models deeponet oformer deokan \
+    --ratios 0 0.1 0.3 0.5 0.7 0.9
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+from dataclasses import dataclass
+import json
+import math
+import os
+import random
+import re
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+
+import numpy as np
+import h5py
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, Subset
+
+
+# ============================================================
+# 0. Reproducibility
+# ============================================================
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def to_device(x: torch.Tensor, device: torch.device) -> torch.Tensor:
+    return x.to(device, non_blocking=True)
+
+
+# ============================================================
+# 1. Task specs (Table 6/7 相当)
+# ============================================================
+
+@dataclass(frozen=True)
+class TaskSpec:
+    name: str
+    spatial_dim: int
+    grid_shape: Tuple[int, ...]   # (100,), (32,32), (16,16,16)
+    n_time: int                   # Darcy2D は 1
+    has_time: bool                # Darcy2D は False（steady）
+    Ns: int                       # センサ数（= 空間グリッド点数）
+    periodic_1d: bool             # 1D only（Uniform選択で使用）
+    endpoint_1d: bool             # 1D only（linspace endpoint）
+    n_train_expected: int         # sanity check 用（必須ではない）
+    n_test_expected: int
+
+
+TASK_SPECS: Dict[str, TaskSpec] = {
+    # 1D
+    "Advection": TaskSpec("Advection", 1, (100,), 101, True, 100, True,  False, 1024, 256),
+    "Burgers1D": TaskSpec("Burgers1D", 1, (100,), 101, True, 100, True,  False, 1024, 256),
+    "Wave":      TaskSpec("Wave",      1, (100,), 101, True, 100, True,  False, 1024, 256),
+    "Heat":      TaskSpec("Heat",      1, (100,), 101, True, 100, False, False, 1024, 256),
+    "DiffusionReaction1D": TaskSpec("DiffusionReaction1D", 1, (100,), 101, True, 100, False, True, 1024, 256),
+    "DiffusionSorption1D": TaskSpec("DiffusionSorption1D", 1, (100,), 101, True, 100, False, True, 1024, 256),
+    # 2D
+    "Darcy2D": TaskSpec("Darcy2D", 2, (32, 32), 1,  False, 1024, False, False, 512, 128),
+    "ShallowWater2D": TaskSpec("ShallowWater2D", 2, (32, 32), 51, True, 1024, False, False, 512, 128),
+    "CompressibleNS2D": TaskSpec("CompressibleNS2D", 2, (32, 32), 21, True, 1024, False, False, 256, 64),
+    # 3D
+    "CompressibleNS3D": TaskSpec("CompressibleNS3D", 3, (16, 16, 16), 21, True, 4096, False, False, 128, 32),
+}
+
+
+def default_epochs(spec: TaskSpec) -> int:
+    # Table 8: 1D 400 / 2D 300 / 3D 250
+    return {1: 400, 2: 300, 3: 250}[spec.spatial_dim]
+
+
+def default_batch_size(spec: TaskSpec) -> int:
+    # Table 8: 1D 32 / 2D 8 / 3D 2
+    return {1: 32, 2: 8, 3: 2}[spec.spatial_dim]
+
+
+# ============================================================
+# 2. Normalization (Table 8: z-score on train)
+# ============================================================
+
+class ZScoreNormalizer:
+    """
+    Z-score normalizer.
+      - fit_from_batches は x: [batch, dim] を想定
+    """
+    def __init__(self, eps: float = 1e-12):
+        self.eps = eps
+        self.mean: Optional[torch.Tensor] = None
+        self.std: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _update(count: int, mean: torch.Tensor, m2: torch.Tensor, x: torch.Tensor) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        b = x.shape[0]
+        new_count = count + b
+        x_mean = x.mean(dim=0)
+        delta = x_mean - mean
+        mean = mean + delta * (b / new_count)
+        # batch var * b + shift correction
+        m2 = m2 + x.var(dim=0, unbiased=False) * b + (delta ** 2) * (count * b / new_count)
+        return new_count, mean, m2
+
+    def fit_from_batches(self, batches: Iterable[torch.Tensor]) -> None:
+        count = 0
+        mean = None
+        m2 = None
+        for x in batches:
+            x = x.float()
+            if mean is None:
+                mean = x.mean(dim=0)
+                m2 = x.var(dim=0, unbiased=False) * x.shape[0]
+                count = x.shape[0]
+            else:
+                count, mean, m2 = self._update(count, mean, m2, x)
+        if mean is None or m2 is None:
+            raise ValueError("No data to fit normalizer.")
+        var = m2 / max(count, 1)
+        self.mean = mean
+        self.std = torch.sqrt(var + self.eps)
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mean is None or self.std is None:
+            raise RuntimeError("Normalizer is not fitted.")
+        return (x - self.mean.to(x.device)) / self.std.to(x.device)
+
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mean is None or self.std is None:
+            raise RuntimeError("Normalizer is not fitted.")
+        return x * self.std.to(x.device) + self.mean.to(x.device)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "mean": self.mean.detach().cpu().numpy().tolist() if self.mean is not None else None,
+            "std": self.std.detach().cpu().numpy().tolist() if self.std is not None else None,
+            "eps": self.eps,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ZScoreNormalizer":
+        obj = cls(eps=float(d.get("eps", 1e-12)))
+        if d.get("mean") is not None:
+            obj.mean = torch.tensor(d["mean"], dtype=torch.float32)
+        if d.get("std") is not None:
+            obj.std = torch.tensor(d["std"], dtype=torch.float32)
+        return obj
+
+
+# ============================================================
+# 3. PDEBench HDF5 loader (heuristic + override)
+# ============================================================
+
+@dataclass
+class IOKeys:
+    input_key: str
+    output_key: str
+    x_key: Optional[str] = None
+    y_key: Optional[str] = None
+    z_key: Optional[str] = None
+    t_key: Optional[str] = None
+
+
+def load_io_keys_json(path: Optional[str]) -> Dict[str, IOKeys]:
+    if path is None:
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return {k: IOKeys(**v) for k, v in raw.items()}
+
+
+def find_task_split_files(data_root: str, task_name: str) -> Tuple[str, str]:
+    root = Path(data_root)
+    if not root.exists():
+        raise FileNotFoundError(f"--data_root not found: {data_root}")
+
+    def search(split: str) -> List[Path]:
+        patt_task = re.compile(rf"{re.escape(task_name)}", re.IGNORECASE)
+        patt_split = re.compile(rf"{split}", re.IGNORECASE)
+        hits: List[Path] = []
+        for ext in ("*.h5", "*.hdf5"):
+            for p in root.rglob(ext):
+                if patt_task.search(p.name) and patt_split.search(p.name):
+                    hits.append(p)
+        return sorted(hits)
+
+    trains = search("train")
+    tests = search("test")
+    if not trains or not tests:
+        raise FileNotFoundError(
+            f"Could not auto-find train/test HDF5 for task='{task_name}' under {data_root}.\n"
+            f"Try --io_keys_json and/or explicitly provide file paths by modifying the script."
+        )
+    return str(trains[0]), str(tests[0])
+
+
+def list_h5_datasets(h5obj: h5py.Group) -> List[str]:
+    out: List[str] = []
+    def visitor(name: str, obj: Any) -> None:
+        if isinstance(obj, h5py.Dataset):
+            out.append(name)
+    h5obj.visititems(visitor)
+    return out
+
+
+def _get_group_or_self(h5: h5py.File, group_name: Optional[str]) -> h5py.Group:
+    if group_name is None:
+        return h5
+    return h5[group_name] if group_name in h5 else h5
+
+
+def _maybe_np(x: Any) -> np.ndarray:
+    if isinstance(x, np.ndarray):
+        return x
+    if isinstance(x, h5py.Dataset):
+        return x[()]
+    raise TypeError(type(x))
+
+
+def _infer_input_output_keys(grp: h5py.Group, spec: TaskSpec) -> Tuple[str, str]:
+    # coordinate-like names are excluded
+    coord_names = {"x", "y", "z", "t", "coords", "grid", "mesh", "points"}
+    items = []
+    for name in list_h5_datasets(grp):
+        base = name.split("/")[-1].lower()
+        if base in coord_names:
+            continue
+        ds = grp[name]
+        ndim = len(ds.shape)
+        size = int(np.prod(ds.shape))
+        items.append((name, ndim, size, ds.shape))
+    if not items:
+        raise KeyError("No datasets found. Please provide --io_keys_json.")
+    items = sorted(items, key=lambda x: (x[1], x[2]), reverse=True)
+    out_key = items[0][0]
+    in_key = items[1][0] if len(items) > 1 else items[0][0]
+    return in_key, out_key
+
+
+def _ensure_input_shape(arr: np.ndarray, spec: TaskSpec) -> np.ndarray:
+    """
+    -> [N, Ns, C_in]
+    """
+    n = arr.shape[0]
+    grid_elems = int(np.prod(spec.grid_shape))
+
+    if arr.ndim == 2:
+        # [N, Ns]
+        if arr.shape[1] != spec.Ns:
+            raise ValueError(f"Input shape mismatch: got {arr.shape}, expected second dim Ns={spec.Ns}")
+        return arr.reshape(n, spec.Ns, 1)
+
+    if arr.ndim == 3 and arr.shape[1] == spec.Ns:
+        # [N, Ns, C]
+        return arr
+
+    # grid-form: [N, *grid] / [N, *grid, C] / [N, C, *grid]
+    if arr.ndim == 1 + spec.spatial_dim and arr.shape[1:] == spec.grid_shape:
+        return arr.reshape(n, grid_elems, 1)
+
+    if arr.ndim == 1 + spec.spatial_dim + 1:
+        # channel-last
+        if arr.shape[1:-1] == spec.grid_shape:
+            c = arr.shape[-1]
+            return arr.reshape(n, grid_elems, c)
+        # channel-first
+        if arr.shape[2:] == spec.grid_shape:
+            c = arr.shape[1]
+            perm = (0, *range(2, 2 + spec.spatial_dim), 1)  # N,*grid,C
+            arr2 = np.transpose(arr, perm)
+            return arr2.reshape(n, grid_elems, c)
+
+    raise ValueError(f"Unable to reshape input: got {arr.shape}, expected grid={spec.grid_shape}")
+
+
+def _ensure_output_shape(arr: np.ndarray, spec: TaskSpec) -> np.ndarray:
+    """
+    -> [N, T, Ns, C_out]   (steady has T=1)
+    """
+    n = arr.shape[0]
+    grid_elems = int(np.prod(spec.grid_shape))
+
+    if spec.has_time:
+        # [N, T, *grid] / [N, T, *grid, C] / [N, T, C, *grid]
+        if arr.ndim == 1 + 1 + spec.spatial_dim and arr.shape[1] == spec.n_time and arr.shape[2:] == spec.grid_shape:
+            return arr.reshape(n, spec.n_time, grid_elems, 1)
+        if arr.ndim == 1 + 1 + spec.spatial_dim + 1 and arr.shape[1] == spec.n_time and arr.shape[2:-1] == spec.grid_shape:
+            c = arr.shape[-1]
+            return arr.reshape(n, spec.n_time, grid_elems, c)
+        if arr.ndim == 1 + 1 + 1 + spec.spatial_dim and arr.shape[1] == spec.n_time and arr.shape[3:] == spec.grid_shape:
+            c = arr.shape[2]
+            perm = (0, 1, *range(3, 3 + spec.spatial_dim), 2)  # N,T,*grid,C
+            arr2 = np.transpose(arr, perm)
+            return arr2.reshape(n, spec.n_time, grid_elems, c)
+        raise ValueError(f"Unable to reshape output(time): got {arr.shape}, expected T={spec.n_time}, grid={spec.grid_shape}")
+
+    # steady: [N,*grid] / [N,*grid,C] / [N,C,*grid]
+    if arr.ndim == 1 + spec.spatial_dim and arr.shape[1:] == spec.grid_shape:
+        return arr.reshape(n, 1, grid_elems, 1)
+    if arr.ndim == 1 + spec.spatial_dim + 1 and arr.shape[1:-1] == spec.grid_shape:
+        c = arr.shape[-1]
+        return arr.reshape(n, 1, grid_elems, c)
+    if arr.ndim == 1 + 1 + spec.spatial_dim and arr.shape[2:] == spec.grid_shape:
+        c = arr.shape[1]
+        perm = (0, *range(2, 2 + spec.spatial_dim), 1)  # N,*grid,C
+        arr2 = np.transpose(arr, perm)
+        return arr2.reshape(n, 1, grid_elems, c)
+    raise ValueError(f"Unable to reshape output(steady): got {arr.shape}, expected grid={spec.grid_shape}")
+
+
+def _load_coords(grp: h5py.Group, keys: IOKeys) -> Dict[str, np.ndarray]:
+    coords: Dict[str, np.ndarray] = {}
+    for axis, k in [("x", keys.x_key), ("y", keys.y_key), ("z", keys.z_key), ("t", keys.t_key)]:
+        if k is None:
+            continue
+        if k in grp:
+            coords[axis] = _maybe_np(grp[k])
+    return coords
+
+
+def load_task_arrays(
+    spec: TaskSpec,
+    train_file: str,
+    test_file: str,
+    io_keys: Optional[IOKeys],
+    train_group: Optional[str],
+    test_group: Optional[str],
+) -> Tuple[Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]], Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]]:
+    def read_one(path: str, group_name: Optional[str]) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+        with h5py.File(path, "r") as h5:
+            grp = _get_group_or_self(h5, group_name)
+            if io_keys is None:
+                in_key, out_key = _infer_input_output_keys(grp, spec)
+                keys_local = IOKeys(in_key, out_key)
+            else:
+                keys_local = io_keys
+            if keys_local.input_key not in grp or keys_local.output_key not in grp:
+                raise KeyError(
+                    f"input/output keys not found in {path} (group={group_name}). "
+                    f"Available: {list_h5_datasets(grp)[:50]}"
+                )
+            x = _maybe_np(grp[keys_local.input_key])
+            y = _maybe_np(grp[keys_local.output_key])
+            coords = _load_coords(grp, keys_local)
+
+        x2 = _ensure_input_shape(x, spec)
+        y2 = _ensure_output_shape(y, spec)
+        return x2, y2, coords
+
+    train = read_one(train_file, train_group)
+    test = read_one(test_file, test_group)
+    return train, test
+
+
+class ArrayPDEDataset(Dataset):
+    def __init__(self, x: np.ndarray, y: np.ndarray):
+        self.x = x  # [N,Ns,Cin]
+        self.y = y  # [N,T,Ns,Cout]
+        if self.x.shape[0] != self.y.shape[0]:
+            raise ValueError("x/y sample mismatch")
+
+    def __len__(self) -> int:
+        return int(self.x.shape[0])
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.from_numpy(self.x[idx]).float(), torch.from_numpy(self.y[idx]).float()
+
+
+def split_train_val(dataset: Dataset, val_fraction: float, split_seed: int) -> Tuple[Subset, Subset]:
+    n = len(dataset)
+    idx = np.arange(n)
+    rng = np.random.RandomState(split_seed)
+    rng.shuffle(idx)
+    n_val = max(1, int(round(n * val_fraction)))
+    val_idx = idx[:n_val].tolist()
+    train_idx = idx[n_val:].tolist()
+    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+
+# ============================================================
+# 4. Coordinate grids
+# ============================================================
+
+def _default_linspace(n: int, endpoint: bool) -> np.ndarray:
+    return np.linspace(0.0, 1.0, n, endpoint=endpoint, dtype=np.float32)
+
+
+def make_sensor_coords(spec: TaskSpec, coords: Dict[str, np.ndarray]) -> np.ndarray:
+    if spec.spatial_dim == 1:
+        x = coords.get("x", _default_linspace(spec.grid_shape[0], endpoint=spec.endpoint_1d)).reshape(-1).astype(np.float32)
+        return x[:, None]  # [Ns,1]
+
+    if spec.spatial_dim == 2:
+        x = coords.get("x", _default_linspace(spec.grid_shape[0], endpoint=False)).reshape(-1).astype(np.float32)
+        y = coords.get("y", _default_linspace(spec.grid_shape[1], endpoint=False)).reshape(-1).astype(np.float32)
+        xx, yy = np.meshgrid(x, y, indexing="ij")
+        pts = np.stack([xx, yy], axis=-1).reshape(-1, 2)
+        if pts.shape[0] != spec.Ns:
+            raise ValueError("Ns mismatch in 2D coords")
+        return pts
+
+    if spec.spatial_dim == 3:
+        x = coords.get("x", _default_linspace(spec.grid_shape[0], endpoint=False)).reshape(-1).astype(np.float32)
+        y = coords.get("y", _default_linspace(spec.grid_shape[1], endpoint=False)).reshape(-1).astype(np.float32)
+        z = coords.get("z", _default_linspace(spec.grid_shape[2], endpoint=False)).reshape(-1).astype(np.float32)
+        xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
+        pts = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+        if pts.shape[0] != spec.Ns:
+            raise ValueError("Ns mismatch in 3D coords")
+        return pts
+
+    raise ValueError(spec.spatial_dim)
+
+
+def make_query_coords(spec: TaskSpec, coords: Dict[str, np.ndarray]) -> np.ndarray:
+    space = make_sensor_coords(spec, coords)  # [Ns,sd]
+    if not spec.has_time:
+        return space  # [Ns,sd]
+
+    t = coords.get("t", _default_linspace(spec.n_time, endpoint=True)).reshape(-1).astype(np.float32)
+    if t.shape[0] != spec.n_time:
+        raise ValueError("t length mismatch")
+    T = spec.n_time
+    Ns = space.shape[0]
+    space_rep = np.repeat(space[None, :, :], T, axis=0)        # [T,Ns,sd]
+    t_rep = np.repeat(t[:, None], Ns, axis=1)[:, :, None]      # [T,Ns,1]
+    y = np.concatenate([space_rep, t_rep], axis=-1)            # [T,Ns,sd+1]
+    return y.reshape(T * Ns, spec.spatial_dim + 1)
+
+
+def coord_to_model_range(y: torch.Tensor) -> torch.Tensor:
+    # [0,1] -> [-1,1]
+    return y * 2.0 - 1.0
+
+
+# ============================================================
+# 5. Sensor set generation: Top-k / Uniform / Random
+# ============================================================
+
+def reduction_ratio_to_k(Ns: int, r: float) -> int:
+    k = int(round((1.0 - r) * Ns))
+    return max(1, min(Ns, k))
+
+
+def topk_indices(importance: np.ndarray, k: int) -> np.ndarray:
+    idx = np.argsort(importance)[::-1][:k]
+    return np.sort(idx.astype(np.int64))
+
+
+def uniform_indices_1d(Ns: int, k: int, periodic: bool, endpoint: bool) -> np.ndarray:
+    if k >= Ns:
+        return np.arange(Ns, dtype=np.int64)
+    if periodic or (not endpoint):
+        idx = np.floor(np.linspace(0, Ns, num=k, endpoint=False)).astype(np.int64)
+        idx = np.clip(idx, 0, Ns - 1)
+        idx = np.unique(idx)
+    else:
+        idx = np.linspace(0, Ns - 1, num=k, endpoint=True).round().astype(np.int64)
+        idx = np.clip(idx, 0, Ns - 1)
+        idx = np.unique(idx)
+    # fill if duplicates
+    if idx.shape[0] < k:
+        missing = k - idx.shape[0]
+        candidates = np.setdiff1d(np.arange(Ns), idx, assume_unique=False)
+        idx = np.concatenate([idx, candidates[:missing]])
+    return np.sort(idx[:k])
+
+
+def uniform_indices_grid(grid_shape: Tuple[int, ...], k: int) -> np.ndarray:
+    """
+    任意のkに対して「なるべく一様な」subset を deterministically 作る簡易実装。
+    """
+    Ns = int(np.prod(grid_shape))
+    if k >= Ns:
+        return np.arange(Ns, dtype=np.int64)
+    dim = len(grid_shape)
+    density = k / Ns
+    step = max(1, int(round((1.0 / max(density, 1e-12)) ** (1.0 / dim))))
+    axes = [np.arange(0, n, step, dtype=np.int64) for n in grid_shape]
+    mesh = np.meshgrid(*axes, indexing="ij")
+    coords = np.stack([m.reshape(-1) for m in mesh], axis=-1)
+    multipliers = np.cumprod((1,) + grid_shape[::-1][:-1])[::-1]
+    base = np.sum(coords * multipliers, axis=-1).astype(np.int64)
+    base = np.unique(base)
+
+    if base.shape[0] > k:
+        pick = np.linspace(0, base.shape[0] - 1, num=k, endpoint=True).round().astype(np.int64)
+        return np.sort(base[pick])
+
+    if base.shape[0] < k:
+        missing = k - base.shape[0]
+        remaining = np.setdiff1d(np.arange(Ns, dtype=np.int64), base, assume_unique=False)
+        pick = np.linspace(0, remaining.shape[0] - 1, num=missing, endpoint=True).round().astype(np.int64)
+        idx = np.unique(np.concatenate([base, remaining[pick]]))
+        if idx.shape[0] < k:
+            remaining2 = np.setdiff1d(np.arange(Ns, dtype=np.int64), idx, assume_unique=False)
+            idx = np.concatenate([idx, remaining2[: (k - idx.shape[0])]])
+        return np.sort(idx[:k])
+
+    return np.sort(base)
+
+
+def uniform_indices(spec: TaskSpec, k: int) -> np.ndarray:
+    if spec.spatial_dim == 1:
+        return uniform_indices_1d(spec.Ns, k, periodic=spec.periodic_1d, endpoint=spec.endpoint_1d)
+    return uniform_indices_grid(spec.grid_shape, k)
+
+
+def random_indices(Ns: int, k: int, rng: np.random.RandomState) -> np.ndarray:
+    if k >= Ns:
+        return np.arange(Ns, dtype=np.int64)
+    return np.sort(rng.choice(Ns, size=k, replace=False).astype(np.int64))
+
+
+# ============================================================
+# 6. Models (DeepONet / DeepOFormer / DeepOKAN)
+# ============================================================
+
+def make_mlp(in_dim: int, hidden: int, out_dim: int, n_layers: int, act: str = "gelu") -> nn.Module:
+    act_map = {"relu": nn.ReLU, "gelu": nn.GELU, "silu": nn.SiLU, "tanh": nn.Tanh}
+    Act = act_map[act]
+    layers: List[nn.Module] = []
+    d = in_dim
+    for _ in range(n_layers - 1):
+        layers += [nn.Linear(d, hidden), Act()]
+        d = hidden
+    layers.append(nn.Linear(d, out_dim))
+    return nn.Sequential(*layers)
+
+
+class DeepONet(nn.Module):
+    def __init__(self, branch_in: int, coord_dim: int, out_ch: int, p: int = 256, hidden: int = 512):
+        super().__init__()
+        self.out_ch = out_ch
+        self.p = p
+        self.branch = make_mlp(branch_in, hidden, out_ch * p, n_layers=4, act="gelu")
+        self.trunk = make_mlp(coord_dim, hidden // 2, p, n_layers=4, act="gelu")
+        self.bias = nn.Parameter(torch.zeros(out_ch))
+
+    def forward(self, x: torch.Tensor, s_coord: torch.Tensor, q_coord: torch.Tensor) -> torch.Tensor:
+        # x: [B,k,Cin]
+        B, k, Cin = x.shape
+        b = self.branch(x.reshape(B, k * Cin)).reshape(B, self.out_ch, self.p)  # [B,C,p]
+        t = self.trunk(q_coord)                                                # [Q,p]
+        y = torch.einsum("bcp,qp->bqc", b, t) + self.bias[None, None, :]
+        return y
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ff = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model))
+        self.n1 = nn.LayerNorm(d_model)
+        self.n2 = nn.LayerNorm(d_model)
+        self.do = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, _ = self.attn(x, x, x, need_weights=False)
+        x = self.n1(x + self.do(a))
+        f = self.ff(x)
+        x = self.n2(x + self.do(f))
+        return x
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.ff = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model))
+        self.n1 = nn.LayerNorm(d_model)
+        self.n2 = nn.LayerNorm(d_model)
+        self.n3 = nn.LayerNorm(d_model)
+        self.do = nn.Dropout(dropout)
+
+    def forward(self, q: torch.Tensor, mem: torch.Tensor) -> torch.Tensor:
+        a, _ = self.self_attn(q, q, q, need_weights=False)
+        q = self.n1(q + self.do(a))
+        a, _ = self.cross_attn(q, mem, mem, need_weights=False)
+        q = self.n2(q + self.do(a))
+        f = self.ff(q)
+        q = self.n3(q + self.do(f))
+        return q
+
+
+class DeepOFormer(nn.Module):
+    def __init__(
+        self,
+        sensor_coord_dim: int,
+        in_ch: int,
+        query_coord_dim: int,
+        out_ch: int,
+        d_model: int = 256,
+        n_heads: int = 8,
+        n_enc: int = 4,
+        n_dec: int = 4,
+    ):
+        super().__init__()
+        self.out_ch = out_ch
+        self.s_embed = nn.Linear(sensor_coord_dim + in_ch, d_model)
+        self.q_embed = nn.Linear(query_coord_dim, d_model)
+        self.enc = nn.ModuleList([EncoderLayer(d_model, n_heads, d_ff=2 * d_model) for _ in range(n_enc)])
+        self.dec = nn.ModuleList([DecoderLayer(d_model, n_heads, d_ff=2 * d_model) for _ in range(n_dec)])
+        self.proj = nn.Linear(d_model, out_ch)
+
+    def forward(self, x: torch.Tensor, s_coord: torch.Tensor, q_coord: torch.Tensor) -> torch.Tensor:
+        B, k, Cin = x.shape
+        S = s_coord[None, :, :].expand(B, -1, -1)
+        mem = self.s_embed(torch.cat([S, x], dim=-1))  # [B,k,d]
+        for layer in self.enc:
+            mem = layer(mem)
+        Q = q_coord[None, :, :].expand(B, -1, -1)
+        q = self.q_embed(Q)
+        for layer in self.dec:
+            q = layer(q, mem)
+        return self.proj(q)
+
+
+# --- KAN (簡易 hat-spline) ---
+
+def _hat_basis(x: torch.Tensor, knots: torch.Tensor) -> torch.Tensor:
+    delta = knots[1] - knots[0]
+    dist = torch.abs(x[..., None] - knots[None, None, :])
+    return torch.clamp(1.0 - dist / (delta + 1e-12), min=0.0)
+
+
+class KANLinear(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, grid_size: int = 16):
+        super().__init__()
+        self.register_buffer("knots", torch.linspace(-1.0, 1.0, grid_size))
+        self.coeff = nn.Parameter(torch.randn(out_dim, in_dim, grid_size) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, float(self.knots[0]), float(self.knots[-1]))
+        basis = _hat_basis(x, self.knots)  # [B,in,G]
+        return torch.einsum("big,oig->bo", basis, self.coeff) + self.bias
+
+
+class KANMLP(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, n_layers: int, grid_size: int = 16):
+        super().__init__()
+        layers: List[nn.Module] = []
+        d = in_dim
+        for _ in range(n_layers - 1):
+            layers += [KANLinear(d, hidden, grid_size=grid_size), nn.LayerNorm(hidden), nn.GELU()]
+            d = hidden
+        layers.append(KANLinear(d, out_dim, grid_size=grid_size))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DeepOKAN(nn.Module):
+    def __init__(self, branch_in: int, coord_dim: int, out_ch: int, p: int = 256, hidden: int = 512):
+        super().__init__()
+        self.out_ch = out_ch
+        self.p = p
+        self.branch = KANMLP(branch_in, hidden, out_ch * p, n_layers=4, grid_size=16)
+        self.trunk = KANMLP(coord_dim, hidden // 2, p, n_layers=4, grid_size=16)
+        self.bias = nn.Parameter(torch.zeros(out_ch))
+
+    def forward(self, x: torch.Tensor, s_coord: torch.Tensor, q_coord: torch.Tensor) -> torch.Tensor:
+        B, k, Cin = x.shape
+        b = self.branch(x.reshape(B, k * Cin)).reshape(B, self.out_ch, self.p)
+        t = self.trunk(q_coord)
+        return torch.einsum("bcp,qp->bqc", b, t) + self.bias[None, None, :]
+
+
+def build_model(
+    name: Literal["deeponet", "oformer", "deokan"],
+    *,
+    in_ch: int,
+    out_ch: int,
+    sensor_coord_dim: int,
+    query_coord_dim: int,
+    branch_in: int,
+) -> nn.Module:
+    if name == "deeponet":
+        return DeepONet(branch_in, query_coord_dim, out_ch)
+    if name == "oformer":
+        return DeepOFormer(sensor_coord_dim, in_ch, query_coord_dim, out_ch)
+    if name == "deokan":
+        return DeepOKAN(branch_in, query_coord_dim, out_ch)
+    raise ValueError(name)
+
+
+# ============================================================
+# 7. Training / evaluation (BestVal)
+# ============================================================
+
+@dataclass
+class TrainConfig:
+    epochs: int
+    batch_size: int
+    lr: float = 3e-4
+    betas: Tuple[float, float] = (0.9, 0.95)
+    weight_decay: float = 1e-4
+    grad_clip: float = 1.0
+    warmup_epochs: int = 10
+    query_chunk: int = 4096
+    num_workers: int = 0
+
+
+def make_optimizer_and_scheduler(model: nn.Module, cfg: TrainConfig):
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay)
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < cfg.warmup_epochs:
+            return (epoch + 1) / max(cfg.warmup_epochs, 1)
+        prog = (epoch - cfg.warmup_epochs) / max(cfg.epochs - cfg.warmup_epochs, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * min(max(prog, 0.0), 1.0)))
+
+    sch = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+    return opt, sch
+
+
+@torch.no_grad()
+def eval_mse_l2re(
+    model: nn.Module,
+    loader: DataLoader,
+    sensor_coords: torch.Tensor,
+    query_coords: torch.Tensor,
+    in_norm: ZScoreNormalizer,
+    out_norm: ZScoreNormalizer,
+    device: torch.device,
+    query_chunk: int,
+    eps_l2re: float = 1e-12,
+) -> Tuple[float, float]:
+    model.eval()
+    total_se = 0.0
+    total_count = 0
+    l2re_sum = 0.0
+    n_samples = 0
+    Q_total = query_coords.shape[0]
+
+    for x_raw, y_raw in loader:
+        x_raw = to_device(x_raw, device)  # [B,k,Cin] (already subset in wrapper)
+        y_raw = to_device(y_raw, device)  # [B,T,Ns,Cout]
+        B = x_raw.shape[0]
+        y_true = y_raw.reshape(B, -1, y_raw.shape[-1])  # [B,Q,Cout]
+
+        x_flat = x_raw.reshape(B, -1)
+        x_normed = in_norm.normalize(x_flat).reshape_as(x_raw)
+
+        se_per = torch.zeros(B, device=device)
+        true_sq_per = torch.zeros(B, device=device)
+
+        for s in range(0, Q_total, query_chunk):
+            e = min(Q_total, s + query_chunk)
+            q = query_coords[s:e]
+            pred_n = model(x_normed, sensor_coords, q)  # normalized
+            pred = out_norm.denormalize(pred_n)
+            true = y_true[:, s:e, :]
+            diff = pred - true
+            total_se += float((diff ** 2).sum().item())
+            total_count += diff.numel()
+            se_per += (diff ** 2).sum(dim=(1, 2))
+            true_sq_per += (true ** 2).sum(dim=(1, 2))
+
+        l2re = torch.sqrt(se_per + eps_l2re) / torch.sqrt(true_sq_per + eps_l2re)
+        l2re_sum += float(l2re.sum().item())
+        n_samples += B
+
+    return total_se / max(total_count, 1), l2re_sum / max(n_samples, 1)
+
+
+def train_with_bestval(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    sensor_coords: torch.Tensor,
+    query_coords: torch.Tensor,
+    in_norm: ZScoreNormalizer,
+    out_norm: ZScoreNormalizer,
+    device: torch.device,
+    cfg: TrainConfig,
+    run_dir: Path,
+) -> Tuple[str, float, int]:
+    """
+    Returns:
+      best_ckpt_path, best_val_mse, best_epoch
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    model = model.to(device)
+    opt, sch = make_optimizer_and_scheduler(model, cfg)
+    best_val = float("inf")
+    best_epoch = -1
+    best_path = run_dir / "best.pt"
+
+    Q_total = query_coords.shape[0]
+    query_coords = query_coords.to(device)
+    sensor_coords = sensor_coords.to(device)
+
+    for epoch in range(cfg.epochs):
+        model.train()
+        for x_raw, y_raw in train_loader:
+            x_raw = to_device(x_raw, device)  # [B,k,Cin]
+            y_raw = to_device(y_raw, device)  # [B,T,Ns,Cout]
+            B = x_raw.shape[0]
+            y_true = y_raw.reshape(B, -1, y_raw.shape[-1])  # [B,Q,Cout]
+
+            x_normed = in_norm.normalize(x_raw.reshape(B, -1)).reshape_as(x_raw)
+            y_normed = out_norm.normalize(y_true)
+
+            opt.zero_grad(set_to_none=True)
+            for s in range(0, Q_total, cfg.query_chunk):
+                e = min(Q_total, s + cfg.query_chunk)
+                q = query_coords[s:e]
+                pred = model(x_normed, sensor_coords, q)
+                tgt = y_normed[:, s:e, :]
+                loss = F.mse_loss(pred, tgt, reduction="mean")
+                (loss * ((e - s) / Q_total)).backward()
+            if cfg.grad_clip and cfg.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            opt.step()
+
+        sch.step()
+
+        val_mse, _ = eval_mse_l2re(
+            model, val_loader, sensor_coords, query_coords, in_norm, out_norm, device, query_chunk=cfg.query_chunk
+        )
+        if val_mse < best_val:
+            best_val = val_mse
+            best_epoch = epoch
+            torch.save({"model": model.state_dict(), "epoch": epoch, "val_mse": best_val}, best_path)
+
+    # reload best
+    ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    return str(best_path), float(best_val), int(ckpt["epoch"])
+
+
+# ============================================================
+# 8. Jacobian-energy importance (Hutchinson)
+# ============================================================
+
+def estimate_importance_hutchinson(
+    model: nn.Module,
+    train_loader: DataLoader,
+    sensor_coords: torch.Tensor,
+    query_coords: torch.Tensor,
+    in_norm: ZScoreNormalizer,
+    device: torch.device,
+    *,
+    n_probes: int = 1,
+    query_chunk: int = 4096,
+) -> np.ndarray:
+    """
+    Hutchinson: diag(J^T J) = E_v[(J^T v)^2]
+    重要度 I_j ≈ (1/(M*P)) Σ_m Σ_{p,c} (∂u_c(y_p)/∂u0_j)^2
+    => diag(J^T J)/P を M で平均。
+    """
+    model.eval()
+    model = model.to(device)
+    sensor_coords = sensor_coords.to(device)
+    query_coords = query_coords.to(device)
+    Ns = sensor_coords.shape[0]
+    Q_total = query_coords.shape[0]
+
+    imp = torch.zeros(Ns, device=device)
+    count = 0
+
+    for x_raw, _ in tqdm(train_loader, desc="Top-k importance", leave=False):
+        x_raw = to_device(x_raw, device)  # [B,Ns,Cin]
+        B, Ns_here, Cin = x_raw.shape
+        if Ns_here != Ns:
+            raise ValueError("Ns mismatch for importance")
+        x_normed = in_norm.normalize(x_raw.reshape(B, -1)).reshape_as(x_raw)
+        x_normed = x_normed.detach().requires_grad_(True)
+
+        for _probe in range(n_probes):
+            g_total = torch.zeros_like(x_normed)
+            for s in range(0, Q_total, query_chunk):
+                e = min(Q_total, s + query_chunk)
+                q = query_coords[s:e]
+                pred = model(x_normed, sensor_coords, q)  # [B,q,Cout]
+                v = torch.empty_like(pred).bernoulli_(0.5) * 2.0 - 1.0
+                g = torch.autograd.grad(
+                    outputs=pred,
+                    inputs=x_normed,
+                    grad_outputs=v,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
+                g_total = g_total + g
+
+            # sum over input channels -> per sensor
+            per_sensor = (g_total ** 2).sum(dim=-1) / float(Q_total)  # [B,Ns]
+            imp += per_sensor.sum(dim=0)
+            count += B
+
+    imp = imp / max(count, 1)
+    return imp.detach().cpu().numpy()
+
+
+# ============================================================
+# 9. Datasets for sensor subsets + normalizer fitting
+# ============================================================
+
+class SensorSubsetDataset(Dataset):
+    """
+    base: returns x_full [Ns,Cin], y_full [T,Ns,Cout]
+    this: returns x_sub  [k,Cin],  y_full unchanged
+    """
+    def __init__(self, base: Dataset, sensor_idx: np.ndarray):
+        self.base = base
+        self.sensor_idx = torch.from_numpy(sensor_idx.astype(np.int64))
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, y = self.base[idx]
+        x_sub = x.index_select(0, self.sensor_idx)
+        return x_sub, y
+
+
+def fit_input_normalizer(dataset: Dataset, sensor_idx: np.ndarray, batch: int = 64) -> ZScoreNormalizer:
+    norm = ZScoreNormalizer()
+    def batches() -> Iterable[torch.Tensor]:
+        buf: List[torch.Tensor] = []
+        for x, _ in dataset:
+            # x: [Ns,Cin]
+            buf.append(x[sensor_idx].reshape(1, -1))
+            if len(buf) >= batch:
+                yield torch.cat(buf, dim=0)
+                buf.clear()
+        if buf:
+            yield torch.cat(buf, dim=0)
+    norm.fit_from_batches(batches())
+    return norm
+
+
+def fit_output_normalizer(dataset: Dataset, batch: int = 16) -> ZScoreNormalizer:
+    norm = ZScoreNormalizer()
+    def batches() -> Iterable[torch.Tensor]:
+        buf: List[torch.Tensor] = []
+        for _, y in dataset:
+            # y: [T,Ns,Cout]
+            buf.append(y.reshape(-1, y.shape[-1]))
+            if len(buf) >= batch:
+                yield torch.cat(buf, dim=0)
+                buf.clear()
+        if buf:
+            yield torch.cat(buf, dim=0)
+    norm.fit_from_batches(batches())
+    return norm
+
+
+# ============================================================
+# 10. One run (train + test)
+# ============================================================
+
+def run_one_training(
+    *,
+    spec: TaskSpec,
+    model_name: Literal["deeponet", "oformer", "deokan"],
+    sensor_idx: np.ndarray,
+    train_ds: Dataset,
+    val_ds: Dataset,
+    test_ds: Dataset,
+    sensor_coords_full: np.ndarray,
+    query_coords_full: np.ndarray,
+    out_norm: ZScoreNormalizer,
+    device: torch.device,
+    seed: int,
+    cfg: TrainConfig,
+    run_dir: Path,
+) -> Dict[str, Any]:
+    set_global_seed(seed)
+
+    train_sub = SensorSubsetDataset(train_ds, sensor_idx)
+    val_sub = SensorSubsetDataset(val_ds, sensor_idx)
+    test_sub = SensorSubsetDataset(test_ds, sensor_idx)
+
+    in_norm = fit_input_normalizer(train_ds, sensor_idx)
+
+    # coords (map to [-1,1] for both sensor & query)
+    sensor_coords = coord_to_model_range(torch.from_numpy(sensor_coords_full[sensor_idx]).float())
+    query_coords = coord_to_model_range(torch.from_numpy(query_coords_full).float())
+
+    train_loader = DataLoader(train_sub, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_sub, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
+    test_loader = DataLoader(test_sub, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
+
+    x0, y0 = train_sub[0]
+    k, Cin = x0.shape
+    Cout = y0.shape[-1]
+    model = build_model(
+        model_name,
+        in_ch=Cin,
+        out_ch=Cout,
+        sensor_coord_dim=sensor_coords.shape[-1],
+        query_coord_dim=query_coords.shape[-1],
+        branch_in=k * Cin,
+    )
+
+    best_path, best_val, best_epoch = train_with_bestval(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        sensor_coords=sensor_coords,
+        query_coords=query_coords,
+        in_norm=in_norm,
+        out_norm=out_norm,
+        device=device,
+        cfg=cfg,
+        run_dir=run_dir,
+    )
+
+    # load best and test
+    ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    model = model.to(device)
+
+    test_mse, test_l2re = eval_mse_l2re(
+        model, test_loader, sensor_coords.to(device), query_coords.to(device),
+        in_norm, out_norm, device, query_chunk=cfg.query_chunk
+    )
+
+    return {
+        "seed": int(seed),
+        "k": int(sensor_idx.shape[0]),
+        "best_val_mse": float(best_val),
+        "best_epoch": int(best_epoch),
+        "test_mse": float(test_mse),
+        "test_l2re": float(test_l2re),
+        "run_dir": str(run_dir),
+    }
+
+
+def aggregate_runs(runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    mses = np.array([r["test_mse"] for r in runs], dtype=np.float64)
+    l2rs = np.array([r["test_l2re"] for r in runs], dtype=np.float64)
+    return {
+        "mean": {"test_mse": float(mses.mean()), "test_l2re": float(l2rs.mean())},
+        "std": {"test_mse": float(mses.std(ddof=0)), "test_l2re": float(l2rs.std(ddof=0))},
+    }
+
+
+# ============================================================
+# 11. Main sweep per (task, model)
+# ============================================================
+
+def run_sweep_for_task_model(
+    *,
+    spec: TaskSpec,
+    model_name: Literal["deeponet", "oformer", "deokan"],
+    data_root: str,
+    out_dir: Path,
+    train_file: Optional[str],
+    test_file: Optional[str],
+    ratios: Sequence[float],
+    model_seeds: Sequence[int],
+    topk_importance_seed: int,
+    random_trials: int,
+    val_fraction: float,
+    split_seed: int,
+    device: torch.device,
+    train_group: Optional[str],
+    test_group: Optional[str],
+    io_keys_map: Dict[str, IOKeys],
+    importance_probes: int,
+    importance_query_chunk: int,
+) -> Path:
+    task = spec.name
+    out_task_model = out_dir / task / model_name
+    out_task_model.mkdir(parents=True, exist_ok=True)
+
+    if train_file is not None and test_file is not None:
+        train_path, test_path = train_file, test_file
+    else:
+        train_path, test_path = find_task_split_files(data_root, task)
+    io_keys = io_keys_map.get(task, None)
+
+    (x_tr, y_tr, coords_tr), (x_te, y_te, coords_te) = load_task_arrays(
+        spec, train_path, test_path, io_keys, train_group, test_group
+    )
+    print(f"[{task}] train x={x_tr.shape} y={y_tr.shape} | test x={x_te.shape} y={y_te.shape}")
+
+    train_full = ArrayPDEDataset(x_tr, y_tr)
+    test_full = ArrayPDEDataset(x_te, y_te)
+    train_ds, val_ds = split_train_val(train_full, val_fraction=val_fraction, split_seed=split_seed)
+
+    sensor_coords_full = make_sensor_coords(spec, coords_tr)  # [Ns,sd]
+    query_coords_full = make_query_coords(spec, coords_tr)    # [Q,qd]
+
+    # shared output normalizer
+    out_norm = fit_output_normalizer(train_ds)
+
+    cfg = TrainConfig(
+        epochs=default_epochs(spec),
+        batch_size=default_batch_size(spec),
+        lr=3e-4,
+        betas=(0.9, 0.95),
+        weight_decay=1e-4,
+        grad_clip=1.0,
+        warmup_epochs=10,
+        query_chunk=8192 if spec.spatial_dim == 1 else 4096,
+        num_workers=0,
+    )
+
+    # A) Full training (k=Ns) for model_seeds
+    full_idx = np.arange(spec.Ns, dtype=np.int64)
+    full_runs: List[Dict[str, Any]] = []
+    for seed in model_seeds:
+        run_dir = out_task_model / f"full_seed{seed}"
+        done = run_dir / "done.json"
+        if done.exists():
+            full_runs.append(json.loads(done.read_text(encoding="utf-8")))
+            continue
+        run = run_one_training(
+            spec=spec, model_name=model_name, sensor_idx=full_idx,
+            train_ds=train_ds, val_ds=val_ds, test_ds=test_full,
+            sensor_coords_full=sensor_coords_full, query_coords_full=query_coords_full,
+            out_norm=out_norm, device=device, seed=seed, cfg=cfg, run_dir=run_dir
+        )
+        done.write_text(json.dumps(run, indent=2), encoding="utf-8")
+        full_runs.append(run)
+    full_agg = aggregate_runs(full_runs)
+
+    # B) Top-k importance from one fixed seed (train set only)
+    if topk_importance_seed not in list(model_seeds):
+        raise ValueError("--topk_importance_seed must be included in --model_seeds")
+    imp_run_dir = out_task_model / f"full_seed{topk_importance_seed}"
+    best_path = imp_run_dir / "best.pt"
+    if not best_path.exists():
+        raise FileNotFoundError(f"Best checkpoint missing: {best_path}")
+
+    # rebuild full model
+    x0, y0 = train_full[0]
+    Cin = x0.shape[-1]
+    Cout = y0.shape[-1]
+    model_full = build_model(
+        model_name,
+        in_ch=Cin,
+        out_ch=Cout,
+        sensor_coord_dim=sensor_coords_full.shape[-1],
+        query_coord_dim=query_coords_full.shape[-1],
+        branch_in=spec.Ns * Cin,
+    ).to(device)
+    ckpt = torch.load(best_path, map_location=device)
+    model_full.load_state_dict(ckpt["model"])
+    model_full.eval()
+
+    # full-input normalizer (re-fit on train_ds)
+    in_norm_full = fit_input_normalizer(train_ds, full_idx)
+
+    # importance loader
+    imp_loader = DataLoader(train_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+    imp = estimate_importance_hutchinson(
+        model=model_full,
+        train_loader=imp_loader,
+        sensor_coords=coord_to_model_range(torch.from_numpy(sensor_coords_full).float()),
+        query_coords=coord_to_model_range(torch.from_numpy(query_coords_full).float()),
+        in_norm=in_norm_full,
+        device=device,
+        n_probes=importance_probes,
+        query_chunk=importance_query_chunk,
+    )
+    imp_path = out_task_model / f"importance_seed{topk_importance_seed}.npy"
+    np.save(imp_path, imp)
+
+    # C) Sweep
+    sweep: Dict[str, Any] = {}
+    for r in ratios:
+        k = reduction_ratio_to_k(spec.Ns, r)
+        sweep[str(r)] = {"k": int(k), "methods": {}}
+
+        idx_topk = topk_indices(imp, k)
+        idx_uni = uniform_indices(spec, k)
+
+        # Top-k / Uniform: multiple seeds (reuse full for r=0)
+        for method, idx in [("topk", idx_topk), ("uniform", idx_uni)]:
+            runs: List[Dict[str, Any]] = []
+            for seed in model_seeds:
+                if k == spec.Ns:
+                    runs.append(next(rr for rr in full_runs if rr["seed"] == seed))
+                    continue
+                run_dir = out_task_model / f"{method}_r{r}_seed{seed}"
+                done = run_dir / "done.json"
+                if done.exists():
+                    runs.append(json.loads(done.read_text(encoding="utf-8")))
+                    continue
+                run = run_one_training(
+                    spec=spec, model_name=model_name, sensor_idx=idx,
+                    train_ds=train_ds, val_ds=val_ds, test_ds=test_full,
+                    sensor_coords_full=sensor_coords_full, query_coords_full=query_coords_full,
+                    out_norm=out_norm, device=device, seed=seed, cfg=cfg, run_dir=run_dir
+                )
+                done.write_text(json.dumps(run, indent=2), encoding="utf-8")
+                runs.append(run)
+            sweep[str(r)]["methods"][method] = {"runs": runs, **aggregate_runs(runs)}
+
+        # Random: 30 trials per k (reuse full runs for r=0)
+        runs_rnd: List[Dict[str, Any]] = []
+        if k == spec.Ns:
+            runs_rnd = full_runs.copy()
+        else:
+            for trial in range(random_trials):
+                rng = np.random.RandomState(12345 + trial)
+                idx = random_indices(spec.Ns, k, rng)
+                seed = 100000 + trial  # training seed tied to trial
+                run_dir = out_task_model / f"random_r{r}_trial{trial}"
+                done = run_dir / "done.json"
+                if done.exists():
+                    rr = json.loads(done.read_text(encoding="utf-8"))
+                    runs_rnd.append(rr)
+                    continue
+                run = run_one_training(
+                    spec=spec, model_name=model_name, sensor_idx=idx,
+                    train_ds=train_ds, val_ds=val_ds, test_ds=test_full,
+                    sensor_coords_full=sensor_coords_full, query_coords_full=query_coords_full,
+                    out_norm=out_norm, device=device, seed=seed, cfg=cfg, run_dir=run_dir
+                )
+                run["trial"] = int(trial)
+                done.write_text(json.dumps(run, indent=2), encoding="utf-8")
+                runs_rnd.append(run)
+
+        sweep[str(r)]["methods"]["random"] = {"runs": runs_rnd, **aggregate_runs(runs_rnd)}
+
+    summary = {
+        "task": task,
+        "model": model_name,
+        "spec": dataclasses.asdict(spec),
+        "train_file": train_path,
+        "test_file": test_path,
+        "val_fraction": val_fraction,
+        "split_seed": split_seed,
+        "ratios": list(ratios),
+        "model_seeds": list(model_seeds),
+        "topk_importance_seed": int(topk_importance_seed),
+        "random_trials": int(random_trials),
+        "output_norm": out_norm.to_dict(),
+        "full": {"runs": full_runs, **full_agg},
+        "importance": {"path": str(imp_path), "n_probes": int(importance_probes), "query_chunk": int(importance_query_chunk)},
+        "sweep": sweep,
+    }
+
+    json_path = out_task_model / "exp2_1_sweep.json"
+    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"Saved: {json_path}")
+    return json_path
+
+
+# ============================================================
+# 12. CLI
+# ============================================================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_root", type=str, required=True)
+    p.add_argument("--out_dir", type=str, required=True)
+    p.add_argument("--train_file", type=str, default=None, help="train HDF5 を明示 (task 共通)")
+    p.add_argument("--test_file", type=str, default=None, help="test HDF5 を明示 (task 共通)")
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--tasks", type=str, nargs="+", default=list(TASK_SPECS.keys()))
+    p.add_argument("--models", type=str, nargs="+", default=["deeponet", "oformer", "deokan"],
+                   choices=["deeponet", "oformer", "deokan"])
+    p.add_argument("--ratios", type=float, nargs="+", default=[0, 0.1, 0.3, 0.5, 0.7, 0.9])
+    p.add_argument("--model_seeds", type=int, nargs="+", default=[0, 1, 2])
+    p.add_argument("--topk_importance_seed", type=int, default=0)
+    p.add_argument("--random_trials", type=int, default=30)
+    p.add_argument("--val_fraction", type=float, default=0.1)
+    p.add_argument("--split_seed", type=int, default=0)
+    p.add_argument("--train_group", type=str, default=None)
+    p.add_argument("--test_group", type=str, default=None)
+    p.add_argument("--io_keys_json", type=str, default=None)
+    p.add_argument("--importance_probes", type=int, default=1)
+    p.add_argument("--importance_query_chunk", type=int, default=4096)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    io_keys_map = load_io_keys_json(args.io_keys_json)
+
+    for task in args.tasks:
+        if task not in TASK_SPECS:
+            raise KeyError(f"Unknown task: {task}")
+        spec = TASK_SPECS[task]
+        for model in args.models:
+            run_sweep_for_task_model(
+                spec=spec,
+                model_name=model,  # type: ignore
+                data_root=args.data_root,
+                out_dir=out_dir,
+                train_file=args.train_file,
+                test_file=args.test_file,
+                ratios=args.ratios,
+                model_seeds=args.model_seeds,
+                topk_importance_seed=args.topk_importance_seed,
+                random_trials=args.random_trials,
+                val_fraction=args.val_fraction,
+                split_seed=args.split_seed,
+                device=device,
+                train_group=args.train_group,
+                test_group=args.test_group,
+                io_keys_map=io_keys_map,
+                importance_probes=args.importance_probes,
+                importance_query_chunk=args.importance_query_chunk,
+            )
+
+
+if __name__ == "__main__":
+    main()
