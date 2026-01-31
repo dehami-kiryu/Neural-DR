@@ -53,7 +53,7 @@ def to_device(x: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 # ============================================================
-# 1. Task specs (Table 6/7 相当)
+# 1. Task specs 
 # ============================================================
 
 @dataclass(frozen=True)
@@ -61,12 +61,12 @@ class TaskSpec:
     name: str
     spatial_dim: int
     grid_shape: Tuple[int, ...]   # (100,), (32,32), (16,16,16)
-    n_time: int                   # Darcy2D は 1
-    has_time: bool                # Darcy2D は False（steady）
-    Ns: int                       # センサ数（= 空間グリッド点数）
-    periodic_1d: bool             # 1D only（Uniform選択で使用）
+    n_time: int                   # Darcy2D
+    has_time: bool                # Darcy2D 
+    Ns: int                      
+    periodic_1d: bool             # 1D only
     endpoint_1d: bool             # 1D only（linspace endpoint）
-    n_train_expected: int         # sanity check 用（必須ではない）
+    n_train_expected: int         # sanity check 
     n_test_expected: int
 
 
@@ -104,7 +104,7 @@ def default_batch_size(spec: TaskSpec) -> int:
 class ZScoreNormalizer:
     """
     Z-score normalizer.
-      - fit_from_batches は x: [batch, dim] を想定
+      - fit_from_batches は x: [batch, dim] 
     """
     def __init__(self, eps: float = 1e-12):
         self.eps = eps
@@ -487,9 +487,7 @@ def uniform_indices_1d(Ns: int, k: int, periodic: bool, endpoint: bool) -> np.nd
 
 
 def uniform_indices_grid(grid_shape: Tuple[int, ...], k: int) -> np.ndarray:
-    """
-    任意のkに対して「なるべく一様な」subset を deterministically 作る簡易実装。
-    """
+
     Ns = int(np.prod(grid_shape))
     if k >= Ns:
         return np.arange(Ns, dtype=np.int64)
@@ -637,7 +635,7 @@ class DeepOFormer(nn.Module):
         return self.proj(q)
 
 
-# --- KAN (簡易 hat-spline) ---
+# --- KAN  ---
 
 def _hat_basis(x: torch.Tensor, knots: torch.Tensor) -> torch.Tensor:
     delta = knots[1] - knots[0]
@@ -868,11 +866,8 @@ def estimate_importance_hutchinson(
     n_probes: int = 1,
     query_chunk: int = 4096,
 ) -> np.ndarray:
-    """
-    Hutchinson: diag(J^T J) = E_v[(J^T v)^2]
-    重要度 I_j ≈ (1/(M*P)) Σ_m Σ_{p,c} (∂u_c(y_p)/∂u0_j)^2
-    => diag(J^T J)/P を M で平均。
-    """
+
+
     model.eval()
     model = model.to(device)
     sensor_coords = sensor_coords.to(device)
